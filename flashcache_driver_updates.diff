@@ -1,0 +1,372 @@
+diff --git a/flashcache.h b/flashcache.h
+index 7b5db7a462dadbcfc36b33b313fc77bb1763ab15..eeb1814a756a88100f739649790c8f6d1846a38f 100644
+--- a/flashcache.h
++++ b/flashcache.h
+@@ -25,6 +25,8 @@
+ #ifndef FLASHCACHE_H
+ #define FLASHCACHE_H
+ 
++#include <linux/list.h>
++
+ #define FLASHCACHE_VERSION		4
+ 
+ #define DEV_PATHLEN	128
+@@ -356,7 +358,7 @@ struct cache_c {
+ 
+ 	spinlock_t kcopy_job_alloc_lock;
+ 	struct flashcache_copy_job *kcopy_jobs_head;
+-
++    struct cache_sectors_list *sectors_list;
+ 	struct cache_c	*next_cache;
+ 
+ 	void *sysctl_handle;
+@@ -415,6 +417,18 @@ struct cache_c {
+ #define INVALIDATE	6
+ #define WRITEDISK_SYNC	7
+ 
++#define SECTOR_NUM_LEN sizeof(u_int32_t)
++
++struct sectors_list_item {
++    u_int32_t sector_num;
++    struct list_head list;
++};
++
++struct cache_sectors_list {
++	struct list_head headlist;
++    unsigned int length;
++};
++
+ struct kcached_job {
+ 	struct list_head list;
+ 	struct cache_c *dmc;
+@@ -795,7 +809,11 @@ void flashcache_kcopy_destroy(struct cache_c *dmc);
+ 
+ u_int64_t index_to_md_block(struct cache_c *dmc);
+ 
+-
++int sectors_list_init(struct cache_sectors_list *list);
++int sectors_list_exit(struct cache_sectors_list *list);
++int sectors_list_push(struct cache_sectors_list *list, u_int32_t num);
++int sectors_list_read(struct cache_sectors_list *list, u_int32_t *buf, u_int32_t num);
+ #endif /* __KERNEL__ */
+ 
+ #endif
+diff --git a/flashcache_conf.c b/flashcache_conf.c
+index 6c8212a8da28238b9e71758956b226c6a60bc340..33ec099f00e0abff483a7bb69dc7199ab7b253ef 100644
+--- a/flashcache_conf.c
++++ b/flashcache_conf.c
+@@ -64,6 +64,7 @@
+ #include "flashcache_ioctl.h"
+ 
+ struct cache_c *cache_list_head = NULL;
++struct cache_c *gdmc = NULL;
+ struct work_struct _kcached_wq;
+ u_int64_t size_hist[33];
+ 
+@@ -1366,8 +1367,8 @@ init:
+ 	dmc->blacklist_tail = NULL;
+ 	dmc->num_whitelist_pids = 0;
+ 	dmc->num_blacklist_pids = 0;
+-
+-	flashcache_ctr_procfs(dmc);
++    gdmc = dmc;
++	flashcache_ctr_procfs(dmc);    
+ 
+ 	return 0;
+ 
+diff --git a/flashcache_main.c b/flashcache_main.c
+index e0e7d47ee398c38e9e1a7d8440ebfe3b709205ce..0bc8e6e56af7e4c2dadf9ce7e28d9a13ace68f3b 100644
+--- a/flashcache_main.c
++++ b/flashcache_main.c
+@@ -25,7 +25,6 @@
+ #include <asm/atomic.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+-#include <linux/list.h>
+ #include <linux/blkdev.h>
+ #include <linux/bio.h>
+ #include <linux/slab.h>
+
+@@ -514,7 +513,7 @@ flashcache_do_pending_noerror(struct kcached_job *job)
+ 		cacheblk->nr_queued--;
+ 		if (pending_job->action == INVALIDATE) {
+ 			DPRINTK("flashcache_do_pending: INVALIDATE  %llu",
+-				next_job->bio->bi_sector);
++				pending_job->bio->bi_sector);
+ 			VERIFY(pending_job->bio != NULL);
+ 			queued = flashcache_inval_blocks(dmc, pending_job->bio);
+ 			if (queued) {
+@@ -573,6 +572,10 @@ flashcache_do_io(struct kcached_job *job)
+ 	job->dmc->flashcache_stats.ssd_writes++;
+ 	r = dm_io_async_bvec(1, &job->job_io_regions.cache, WRITE, bio,
+ 			     flashcache_io_callback, job);
++	sectors_list_push(job->dmc->sectors_list,
++	                  (u_int32_t)job->job_io_regions.cache.sector);		     
++	DPRINTK("Write to cache device: %llu, %llu", 
++		job->job_io_regions.cache.sector, job->job_io_regions.cache.count);
+ 	VERIFY(r == 0);
+ 	/* In our case, dm_io_async_bvec() must always return 0 */
+ }
+@@ -2435,6 +2438,93 @@ flashcache_start_uncached_io(struct cache_c *dmc, struct bio *bio)
+ 			 flashcache_uncached_io_callback, job);
+ }
+ 
++int sectors_list_init(struct cache_sectors_list *list)
++{
++	if (list == NULL) {
++	    return -EINVAL;
++    }
++	
++	INIT_LIST_HEAD(&list->headlist);
++    list->length = 0;	
++    return 0;				  
++}
++
++int sectors_list_exit(struct cache_sectors_list *list)
++{
++    struct list_head *pos, *q;
++    struct sectors_list_item *item;
++
++    if (list == NULL) {
++		DPRINTK("sectors_list_exit: list == NULL");
++		return -EINVAL;
++	}
++	
++	if (list_empty(&list->headlist)) {
++		DPRINTK("sectors_list_exit: list is empty");
++		return 0;
++	}
++    
++    list_for_each_safe(pos, q, &list->headlist)
++    {
++        item = list_entry(pos, struct sectors_list_item, list);
++        if ((item != NULL) &&( pos != NULL)) {
++            //DMERR("sectors_list_exit: sector = %lu", item->sector_num);
++            list_del(pos);
++            kfree(item);
++	    }
++    }
++
++    return 0;
++}
++
++int sectors_list_push(struct cache_sectors_list *list, u_int32_t num)
++{
++    void *tmp;
++    struct sectors_list_item *item;
++    
++    if (list == NULL) {
++		return -EINVAL;
++	}
++
++    tmp = kmalloc(sizeof(struct sectors_list_item), GFP_KERNEL);
++    item = (struct sectors_list_item *)tmp;
++
++    if (NULL != item)
++    {
++        item->sector_num = num;
++        list_add_tail(&item->list, &list->headlist);
++        list->length++;
++        return 0;
++    }
++    DMERR("flashcache mem error: malloc failed");
++    return -1;
++}
++
++int sectors_list_read(struct cache_sectors_list *list, u_int32_t *buf,
++                      u_int32_t num)
++{
++	struct list_head *pos, *q;
++    struct sectors_list_item *item = NULL;
++    u_int32_t n = 0;
++    
++    if (list == NULL) {
++		return -EINVAL;
++	}
++
++    list_for_each_safe(pos, q, &list->headlist)
++    {
++        item = list_entry(pos, struct sectors_list_item, list);
++        *buf = item->sector_num;
++        buf++;
++        n++;
++        if (n > num) {
++			break;
++		}
++    }
++    return 0;
++}
++
++
+ EXPORT_SYMBOL(flashcache_io_callback);
+ EXPORT_SYMBOL(flashcache_do_pending_error);
+ EXPORT_SYMBOL(flashcache_do_pending_noerror);
+@@ -2457,5 +2547,3 @@ EXPORT_SYMBOL(flashcache_md_write_kickoff);
+ EXPORT_SYMBOL(flashcache_md_write_done);
+ EXPORT_SYMBOL(flashcache_md_write);
+ EXPORT_SYMBOL(hash_block);
+-
+-
+diff --git a/flashcache_procfs.c b/flashcache_procfs.c
+index e7d40782bdbf4c8846b4e0289831918222ab3d4b..d6b37aff7e62524d08b90da1c3fea8aeca5bb805 100644
+--- a/flashcache_procfs.c
++++ b/flashcache_procfs.c
+@@ -64,6 +64,9 @@ static int fallow_clean_speed_max = FALLOW_SPEED_MAX;
+ 
+ extern u_int64_t size_hist[];
+ 
++struct cache_sectors_list flashcache_sectors_list;
++extern struct cache_c *gdmc;
++
+ static char *flashcache_cons_procfs_cachename(struct cache_c *dmc, char *path_component);
+ static char *flashcache_cons_sysctl_devname(struct cache_c *dmc);
+ 
+@@ -1127,6 +1130,64 @@ static struct file_operations flashcache_version_operations = {
+ 	.release	= single_release,
+ };
+ 
++static ssize_t 
++flashcache_sectors_num_read(struct file *file, char __user *ubuf, 
++                            size_t count, loff_t *ppos)
++{
++	//struct cache_c *dmc = PDE_DATA(file_inode(file));
++	
++	if (gdmc == NULL) {
++		DMERR("flashcache_sectors_num_read: dmc = NULL");
++		return -EFAULT;
++	}	
++	return simple_read_from_buffer(ubuf, count, ppos, 
++	                               (void *)&gdmc->sectors_list->length,
++	                               SECTOR_NUM_LEN);
++}
++
++static struct file_operations flashcache_sectors_num_operations = {
++	.read		= flashcache_sectors_num_read,
++	.llseek     = default_llseek,
++};
++
++static ssize_t 
++flashcache_sectors_read(struct file *file, char __user *ubuf, 
++                        size_t count, loff_t *ppos)
++{
++	//struct cache_c *dmc = PDE_DATA(file_inode(file));
++	u_int32_t *buf;
++	int ret;
++	
++	if (gdmc == NULL) {
++		DMERR("flashcache_sectors_read: dmc = NULL");
++		return -EFAULT;
++	}	
++	
++	buf = kmalloc(gdmc->sectors_list->length*sizeof(u_int32_t), 
++	              GFP_KERNEL);
++	if (buf == NULL) {
++		DMERR("flashcache_sectors_read: kmalloc error");
++		return -ENOMEM;
++	}              
++	
++	ret = sectors_list_read(gdmc->sectors_list, buf,
++                            gdmc->sectors_list->length);
++	if (ret != 0) {
++		DMERR("flashcache_sectors_read: read error");
++		return -EFAULT;
++	} 
++	
++	return 
++	simple_read_from_buffer(ubuf, count, ppos, 
++	                        (void *)buf,
++	                        gdmc->sectors_list->length*sizeof(u_int32_t));
++}
++
++static struct file_operations flashcache_sectors_operations = {
++	.read		= flashcache_sectors_read,
++	.llseek     = default_llseek,
++};
++
+ void
+ flashcache_module_procfs_init(void)
+ {
+@@ -1141,6 +1202,9 @@ flashcache_module_procfs_init(void)
+ 		#endif
+ 		#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+ 			entry = proc_create("flashcache/flashcache_version", 0, NULL, &flashcache_version_operations);
++			
++			entry = proc_create("flashcache/flashcache_sectors", 0, NULL, &flashcache_sectors_operations);
++			entry = proc_create("flashcache/flashcache_sectors_num", 0, NULL, &flashcache_sectors_num_operations);
+ 		#endif	
+ 
+ 	}
+@@ -1152,6 +1216,8 @@ flashcache_module_procfs_release(void)
+ {
+ #ifdef CONFIG_PROC_FS
+ 	(void)remove_proc_entry("flashcache/flashcache_version", NULL);
++	(void)remove_proc_entry("flashcache/flashcache_sectors", NULL);
++	(void)remove_proc_entry("flashcache/flashcache_sectors_num", NULL);
+ 	(void)remove_proc_entry("flashcache", NULL);
+ #endif /* CONFIG_PROC_FS */
+ }
+@@ -1261,9 +1337,44 @@ flashcache_ctr_procfs(struct cache_c *dmc)
+ 	#endif
+ 	kfree(s);
++	
++	s = flashcache_cons_procfs_cachename(dmc, "flashcache_sectors");
++	#if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
++		entry = create_proc_entry(s, 0, NULL);
++		if (entry) {
++			entry->proc_fops =  &flashcache_sectors_operations;
++			entry->data = dmc;
++		}
++	#endif
++	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
++		entry = proc_create_data(s, 0, NULL, 
++		                         &flashcache_sectors_operations, dmc);
++	#endif
++	kfree(s);
++	
++	s = flashcache_cons_procfs_cachename(dmc, "flashcache_sectors_num");
++	#if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
++		entry = create_proc_entry(s, 0, NULL);
++		if (entry) {
++			entry->proc_fops =  &flashcache_sectors_num_operations;
++			entry->data = dmc;
++		}
++	#endif
++	#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
++		entry = proc_create_data(s, 0, NULL, 
++		                       &flashcache_sectors_num_operations, dmc);
++	#endif
++	kfree(s);*/
++	
++	if (sectors_list_init(&flashcache_sectors_list) != 0) {
++		DMERR("sectors_list_init() failed");
++	} else {
++	    dmc->sectors_list = &flashcache_sectors_list;
++	}
+ 
+ 	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK)
+ 		flashcache_writeback_sysctl_register(dmc);
+@@ -1291,15 +1402,24 @@ flashcache_dtr_procfs(struct cache_c *dmc)
+ 	s = flashcache_cons_procfs_cachename(dmc, "flashcache_pidlists");
+ 	remove_proc_entry(s, NULL);
+ 	kfree(s);
++	
++	s = flashcache_cons_procfs_cachename(dmc, "flashcache_sectors");
++	remove_proc_entry(s, NULL);
++	kfree(s);
++	
++	s = flashcache_cons_procfs_cachename(dmc, "flashcache_sectors_num");
++	remove_proc_entry(s, NULL);
++	kfree(s);
+ 
+ 	s = flashcache_cons_procfs_cachename(dmc, "");
+ 	remove_proc_entry(s, NULL);
++	
++	sectors_list_exit(dmc->sectors_list);
+ 
+ 	if (dmc->cache_mode == FLASHCACHE_WRITE_BACK)
+ 		flashcache_writeback_sysctl_unregister(dmc);
+ 	else
+ 		flashcache_writethrough_sysctl_unregister(dmc);
+-
+ }
+ 
